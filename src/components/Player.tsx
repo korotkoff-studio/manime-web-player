@@ -1,241 +1,252 @@
-import React, { useRef, useEffect } from 'react';
-import { CNNM, CNNUL, CNNx2M, CNNx2UL } from 'anime4k-webgpu';
+// src/components/Player.tsx
+import { useRef, useEffect, useState, FC } from 'react';
+import { Anime4KPipeline, ModeA, Original, render } from 'anime4k-webgpu';
 
-const fullscreenTexturedQuadWGSL = `
-struct VertexOutput {
-  @builtin(position) Position : vec4<f32>,
-  @location(0) fragUV : vec2<f32>,
-}
-
-@vertex
-fn vert_main(@builtin(vertex_index) VertexIndex : u32) -> VertexOutput {
-  const pos = array(
-    vec2( 1.0,  1.0),
-    vec2( 1.0, -1.0),
-    vec2(-1.0, -1.0),
-    vec2( 1.0,  1.0),
-    vec2(-1.0, -1.0),
-    vec2(-1.0,  1.0),
-  );
-
-  const uv = array(
-    vec2(1.0, 0.0),
-    vec2(1.0, 1.0),
-    vec2(0.0, 1.0),
-    vec2(1.0, 0.0),
-    vec2(0.0, 1.0),
-    vec2(0.0, 0.0),
-  );
-
-  var output : VertexOutput;
-  output.Position = vec4(pos[VertexIndex], 0.0, 1.0);
-  output.fragUV = uv[VertexIndex];
-  return output;
-}
-`;
-
-const sampleExternalTextureWGSL = `
-@group(0) @binding(1) var mySampler: sampler;
-@group(0) @binding(2) var myTexture: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) fragUV : vec2f) -> @location(0) vec4f {
-  return textureSampleBaseClampToEdge(myTexture, mySampler, fragUV);
-}
-`;
-
-// Определяем интерфейс для пропсов компонента Player
 interface PlayerProps {
     src: string;
 }
 
-const Player: React.FC<PlayerProps> = ({ src }) => {
-    const canvasRef = useRef<HTMLCanvasElement>(null);
-    const videoRef = useRef<HTMLVideoElement>(null);
+const Player: FC<PlayerProps> = ({ src }) => {
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const videoRef = useRef<HTMLVideoElement | null>(null);
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const [loading, setLoading] = useState<boolean>(true);
+    const [error, setError] = useState<string | null>(null);
+    const [muted, setMuted] = useState<boolean>(true);
+    const [useModeA, setUseModeA] = useState<boolean>(true);
+    const renderRef = useRef<any>(null);
 
+    // Эффект для инициализации видео и рендеринга
     useEffect(() => {
-        async function init() {
-            // Создание элемента видео
-            const video = videoRef.current!;
-
-            video.loop = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.src = src;
-            video.setAttribute('crossorigin', 'anonymous');
-
-            await new Promise((resolve) => {
-                video.onloadeddata = resolve;
-            });
-            await video.play();
-            const WIDTH = video.videoWidth;
-            const HEIGHT = video.videoHeight;
-
-            // Настройка WebGPU
-            const canvas = canvasRef.current!;
-            const adapter = await navigator.gpu.requestAdapter();
-            if (!adapter) {
-                console.error('WebGPU не поддерживается на этом устройстве.');
-                return;
-            }
-            const device = await adapter.requestDevice();
-            const context = canvas.getContext('webgpu') as GPUCanvasContext;
-            const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-            context.configure({
-                device,
-                format: presentationFormat,
-                alphaMode: 'premultiplied',
-            });
-
-            // Создание текстуры видео
-            const videoFrameTexture = device.createTexture({
-                size: [WIDTH, HEIGHT, 1],
-                format: 'rgba16float',
-                usage: GPUTextureUsage.TEXTURE_BINDING
-                    | GPUTextureUsage.COPY_DST
-                    | GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-
-            // ++++ Anime4K ++++
-            const upscalePipeline = new CNNx2M({
-                device,
-                inputTexture: videoFrameTexture,
-            });
-            const restorePipeline = new CNNM({
-                device,
-                inputTexture: upscalePipeline.getOutputTexture(),
-            });
-            // Опционально: изменение размера канваса под размер выходной текстуры
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            // ++++ Anime4K ++++
-
-            // Функция для копирования нового кадра видео в текстуру
-            function updateVideoFrameTexture() {
-                device.queue.copyExternalImageToTexture(
-                    { source: video },
-                    { texture: videoFrameTexture },
-                    [WIDTH, HEIGHT],
-                );
-            }
-
-            // Настройка пайплайна рендеринга
-            const renderBindGroupLayout = device.createBindGroupLayout({
-                label: 'Render Bind Group Layout',
-                entries: [
-                    {
-                        binding: 1,
-                        visibility: GPUShaderStage.FRAGMENT,
-                        sampler: {},
-                    },
-                    {
-                        binding: 2,
-                        visibility: GPUShaderStage.FRAGMENT,
-                        texture: {},
-                    }
-                ],
-            });
-
-            const renderPipelineLayout = device.createPipelineLayout({
-                label: 'Render Pipeline Layout',
-                bindGroupLayouts: [renderBindGroupLayout],
-            });
-
-            const renderPipeline = device.createRenderPipeline({
-                layout: renderPipelineLayout,
-                vertex: {
-                    module: device.createShaderModule({
-                        code: fullscreenTexturedQuadWGSL,
-                    }),
-                    entryPoint: 'vert_main',
-                },
-                fragment: {
-                    module: device.createShaderModule({
-                        code: sampleExternalTextureWGSL,
-                    }),
-                    entryPoint: 'main',
-                    targets: [
-                        {
-                            format: presentationFormat,
-                        },
-                    ],
-                },
-                primitive: {
-                    topology: 'triangle-list',
-                },
-            });
-
-            const sampler = device.createSampler({
-                magFilter: 'linear',
-                minFilter: 'linear',
-            });
-
-            const renderBindGroup = device.createBindGroup({
-                layout: renderBindGroupLayout,
-                entries: [
-                    {
-                        binding: 1,
-                        resource: sampler,
-                    },
-                    {
-                        binding: 2,
-                        // +++ Anime4K +++
-                        resource: restorePipeline.getOutputTexture().createView(),
-                        // +++ Anime4K +++
-                    }
-                ],
-            });
-
-            // Цикл рендеринга
-            function frame() {
-                if (!video.paused) {
-                    updateVideoFrameTexture();
-                }
-                const commandEncoder = device.createCommandEncoder();
-                // +++ Anime4K +++
-                upscalePipeline.pass(commandEncoder);
-                restorePipeline.pass(commandEncoder);
-                // +++ Anime4K +++
-                const passEncoder = commandEncoder.beginRenderPass({
-                    colorAttachments: [
-                        {
-                            view: context.getCurrentTexture().createView(),
-                            clearValue: {
-                                r: 0.0, g: 0.0, b: 0.0, a: 1.0,
-                            },
-                            loadOp: 'clear' as GPULoadOp,
-                            storeOp: 'store' as GPUStoreOp,
-                        },
-                    ],
-                });
-                passEncoder.setPipeline(renderPipeline);
-                passEncoder.setBindGroup(0, renderBindGroup);
-                passEncoder.draw(6);
-                passEncoder.end();
-                device.queue.submit([commandEncoder.finish()]);
-                video.requestVideoFrameCallback(frame);
-            }
-
-            // Запуск цикла рендеринга
-            video.requestVideoFrameCallback(frame);
-        }
-
-        // Проверка поддержки WebGPU
-        if (navigator.gpu) {
-            init().catch((err) => {
-                console.error('Ошибка инициализации WebGPU:', err);
-            });
+        if (!navigator.gpu) {
+            console.error('WebGPU не поддерживается в вашем браузере.');
+            setError('Ваш браузер не поддерживает WebGPU.');
+            setLoading(false);
+            return;
         } else {
-            console.error('WebGPU не поддерживается вашим браузером.');
+            console.log('WebGPU поддерживается.');
         }
-    }, [src]);
+
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+
+        if (!video || !canvas) {
+            console.error('Элементы video или canvas не найдены.');
+            setError('Не удалось найти элементы video или canvas.');
+            setLoading(false);
+            return;
+        }
+
+        video.setAttribute('crossorigin', 'anonymous');
+        video.muted = muted;
+        video.src = src;
+
+        const handleCanPlay = () => {
+            console.log('Видео может воспроизводиться.');
+        };
+
+        const handleError = (e: Event) => {
+            console.error('Ошибка видео:', e);
+            setError('Не удалось загрузить видео.');
+            setLoading(false);
+        };
+
+        const handleLoadedMetadata = () => {
+            if (video.videoWidth && video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+                console.log('Метаданные видео загружены.');
+            } else {
+                console.error('Неверные метаданные видео.');
+                setError('Неверные метаданные видео.');
+                setLoading(false);
+            }
+        };
+
+        video.addEventListener('canplay', handleCanPlay);
+        video.addEventListener('error', handleError);
+        video.addEventListener('loadedmetadata', handleLoadedMetadata);
+
+        async function initRender() {
+            console.log('Инициализация anime4k-webgpu...');
+            try {
+                renderRef.current = await render({
+                    video: video!,
+                    canvas: canvas!,
+                    pipelineBuilder: (device, inputTexture) => {
+                        console.log('Построение пайплайна...');
+
+                        let pipeline: Anime4KPipeline;
+
+                        if (useModeA) {
+                            pipeline = new ModeA({
+                                device,
+                                inputTexture,
+                                nativeDimensions: {
+                                    width: video!.videoWidth,
+                                    height: video!.videoHeight,
+                                },
+                                targetDimensions: {
+                                    width: video!.videoWidth * 2,
+                                    height: video!.videoHeight * 2,
+                                },
+                            });
+                            console.log('Используется ModeA.');
+                        } else {
+                            pipeline = new Original({
+                                inputTexture,
+                            });
+                            console.log('Используется Original.');
+                        }
+
+                        console.log('Пайплайн построен.');
+
+                        return [pipeline];
+                    },
+                });
+
+                console.log('Render успешно инициализирован.');
+
+                await video!.play();
+
+                console.log('Видео воспроизведение начато.');
+                setLoading(false);
+            } catch (err) {
+                console.error('Ошибка при инициализации anime4k-webgpu:', err);
+                setError('Не удалось загрузить видео.');
+                setLoading(false);
+            }
+        }
+
+        initRender();
+
+        return () => {
+            console.log('Размонтирование компонента: остановка видео и рендеринга.');
+            if (video) {
+                video.pause();
+                video.removeEventListener('canplay', handleCanPlay);
+                video.removeEventListener('error', handleError);
+                video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+            }
+            if (renderRef.current && typeof renderRef.current.stop === 'function') {
+                renderRef.current.stop();
+                console.log('Render остановлен.');
+            }
+        };
+    }, [src, useModeA]); // Зависимость только от src
+
+    // Эффект для обновления состояния mute
+    useEffect(() => {
+        const video = videoRef.current;
+        if (video) {
+            video.muted = muted;
+            console.log(`Видео ${muted ? 'заглушено' : 'разглушено'}.`);
+        }
+    }, [muted]);
+
+    const toggleMute = () => {
+        setMuted((prevMuted) => !prevMuted);
+    };
+
+    const toggleModeA = () => {
+        setUseModeA((prevUseModeA) => !prevUseModeA);
+    };
 
     return (
-        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', width: '100vw', height: '100vh', overflow: 'hidden' }}>
-            <video ref={videoRef} controls style={{ display: 'none' }} />
+        <div
+            ref={containerRef}
+            style={{
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                width: '100vw',
+                height: '100vh',
+                backgroundColor: '#000',
+                overflow: 'hidden',
+                zIndex: 9999,
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+            }}
+        >
+            {loading && !error && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: '50%',
+                        left: '50%',
+                        transform: 'translate(-50%, -50%)',
+                        background: 'rgba(255, 255, 255, 0.8)',
+                        padding: '10px 20px',
+                        borderRadius: '5px',
+                        zIndex: 1,
+                    }}
+                >
+                    Загрузка видео...
+                </div>
+            )}
+
+            {error && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: '10px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        background: 'rgba(255, 0, 0, 0.8)',
+                        color: 'white',
+                        padding: '10px 20px',
+                        borderRadius: '5px',
+                        zIndex: 1,
+                    }}
+                >
+                    {error}
+                </div>
+            )}
+
+            <button
+                onClick={toggleMute}
+                style={{
+                    position: 'absolute',
+                    bottom: '60px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    padding: '10px 20px',
+                    zIndex: 2,
+                }}
+            >
+                {muted ? 'Включить звук' : 'Выключить звук'}
+            </button>
+
+            <button
+                onClick={toggleModeA}
+                style={{
+                    position: 'absolute',
+                    bottom: '20px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    padding: '10px 20px',
+                    zIndex: 2,
+                }}
+            >
+                {useModeA ? 'Отключить ModeA' : 'Включить ModeA'}
+            </button>
+
+            <video
+                ref={videoRef}
+                controls
+                style={{ display: 'none' }}
+            />
+
             <canvas
                 ref={canvasRef}
-                style={{ maxWidth: '100%', maxHeight: '100%' }}
+                style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'contain',
+                    border: 'none',
+                }}
             />
         </div>
     );
